@@ -1,0 +1,23 @@
+services:
+  archiver:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        UID: 1000
+        GID: 1000
+    container_name: archiver
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      #- ./data:/app/data
+      - /mnt/Videos/uploads:/app/data
+    environment:
+      - TZ=UTC
+    networks:
+      - thpsrun
+
+networks:
+  thpsrun:
+    external: true
