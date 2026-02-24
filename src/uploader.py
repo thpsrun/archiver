@@ -59,7 +59,7 @@ class UploadProgressListener(AbstractProgressListener):
         self._start_time: float | None = None
         self._last_log_time: float = 0
 
-    def set_total_bytes(
+    def set_total_bytes(  # type: ignore
         self,
         total_bytes: int,
     ) -> None:
@@ -118,7 +118,7 @@ class Uploader:
     def _get_api(self) -> B2Api:
         if self._api is None:
             info = InMemoryAccountInfo()
-            self._api = B2Api(info)
+            self._api = B2Api(info)  # type: ignore
             self._api.authorize_account(
                 "production",
                 self.config.b2_application_key_id,
@@ -129,8 +129,8 @@ class Uploader:
     def _get_bucket(self) -> Bucket:
         if self._bucket is None:
             api = self._get_api()
-            self._bucket = api.get_bucket_by_name(self.config.b2_bucket_name)
-        return self._bucket
+            self._bucket = api.get_bucket_by_name(self.config.b2_bucket_name)  # type: ignore
+        return self._bucket  # type: ignore
 
     def upload(self, file_path: str, run_id: str) -> str:
         path = Path(file_path)
@@ -153,7 +153,7 @@ class Uploader:
                 file_name=b2_file_name,
                 total_bytes=file_size,
             )
-            file_version = bucket.upload_local_file(
+            file_ver = bucket.upload_local_file(
                 local_file=str(path),
                 file_name=b2_file_name,
                 progress_listener=progress_listener,
@@ -162,7 +162,7 @@ class Uploader:
             if self.config.archive_url:
                 download_url = f"{self.config.archive_url}/{run_id}.mp4"
             else:
-                download_url = self._api.get_download_url_for_fileid(file_version.id_)
+                download_url = self._api.get_download_url_for_fileid(file_ver.id_)  # type: ignore
 
             logger.info("Upload successful: %s", download_url)
             return download_url
@@ -170,7 +170,7 @@ class Uploader:
             logger.exception("Upload failed for %s", file_path)
             raise UploadError(f"Failed to upload to B2: {e}") from e
 
-    def cleanup_local_file(self, file_path: str) -> None:
+    def cleanup(self, file_path: str) -> None:
         try:
             path = Path(file_path)
             if path.exists():

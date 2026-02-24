@@ -86,11 +86,11 @@ def attempt_recovery(
 ) -> bool:
     queue = db.get_queue(limit=1)
     if not queue:
-        logger.info("Recovery: no items in queue, resuming normal operation")
+        logger.info("Recovery: no items in queue, resuming...")
         db.reset_failures()
         return True
 
-    if _check_all_cookie_failures(db):
+    if _check_cookie_fails(db):
         queue_count = db.get_queue_count()
         logger.error(
             "Recovery: all %d failure(s) are cookie/auth related - "
@@ -131,7 +131,7 @@ def main_loop(
 
             if health.consecutive_failures >= config.consecutive_failure_threshold:
                 logger.warning(
-                    "YouTube appears broken (%d consecutive failures), entering recovery mode",
+                    "YouTube appears broken (%d consecutive failures), entering recovery...",
                     health.consecutive_failures,
                 )
                 db.update_health("broken", health.consecutive_failures)
@@ -267,7 +267,7 @@ def _upload_and_finalize(
                 sentry_sdk.capture_exception(e)
                 return False
             finally:
-                uploader.cleanup_local_file(file_path)
+                uploader.cleanup(file_path)
 
             if not config.skip_api:
                 try:
@@ -303,7 +303,7 @@ def _process_videos_with_pipeline(
     with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
         upload_future: concurrent.futures.Future[bool] | None = None
 
-        def collect_upload_result() -> None:
+        def results() -> None:
             nonlocal succeeded, failed, upload_future
             if upload_future is not None:
                 if upload_future.result():
@@ -348,7 +348,7 @@ def _process_videos_with_pipeline(
                     failed += 1
                 continue
 
-            collect_upload_result()
+            results()
 
             upload_future = executor.submit(
                 _upload_and_finalize,
@@ -367,12 +367,12 @@ def _process_videos_with_pipeline(
                 logger.debug("Sleeping for %.1f seconds", delay)
                 time.sleep(delay)
 
-        collect_upload_result()
+        results()
 
     return succeeded, failed, skipped
 
 
-def _check_all_cookie_failures(
+def _check_cookie_fails(
     db: Database,
 ) -> bool:
     errors = db.get_queue_errors()
@@ -415,7 +415,7 @@ def run_test_mode(
             logger.info("Retry: no failures in queue, skipping retries")
             break
 
-        if _check_all_cookie_failures(db):
+        if _check_cookie_fails(db):
             logger.error(
                 "Retry: all %d failure(s) are cookie/auth related - "
                 "cookies need refreshing, skipping further retries",
