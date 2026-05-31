@@ -15,9 +15,23 @@ services:
       - /mnt/Videos/uploads:/app/data
     environment:
       - TZ=UTC
+    depends_on:
+      - bgutil-provider
     networks:
       - thpsrun
+      - archiver-net
+
+  bgutil-provider:
+    image: brainicism/bgutil-ytdlp-pot-provider:latest
+    container_name: bgutil-provider
+    restart: unless-stopped
+    init: true
+    networks:
+      - archiver-net
 
 networks:
   thpsrun:
     external: true
+    name: website_thpsrun
+  archiver-net:
+    driver: bridge

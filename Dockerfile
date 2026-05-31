@@ -1,4 +1,4 @@
-FROM python:3.14.3-bookworm
+FROM python:3.14.5-bookworm
 
 ARG UID=1002
 ARG GID=1002

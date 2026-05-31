@@ -58,7 +58,10 @@ class DownloadResult:
 
 
 class Downloader:
-    def __init__(self, config: Config):
+    def __init__(
+        self,
+        config: Config,
+    ):
         self.config = config
         self.downloads_dir = Path(config.downloads_dir)
         self.downloads_dir.mkdir(parents=True, exist_ok=True)
@@ -158,7 +161,10 @@ class Downloader:
             pattern.lower() in output_lower for pattern in PERMANENT_FAILURE_PATTERNS
         )
 
-    def _on_error(self, output: str) -> str | None:
+    def _on_error(
+        self,
+        output: str,
+    ) -> str | None:
         lines = output.strip().split("\n")
         for line in reversed(lines):
             line = line.strip()

@@ -45,7 +45,9 @@ class Config:
 def load_config() -> Config:
     load_dotenv()
 
-    def require_env(name: str) -> str:
+    def require_env(
+        name: str,
+    ) -> str:
         value = os.getenv(name)
         if not value:
             raise ValueError(f"Required environment variable {name} is not set")

@@ -26,12 +26,17 @@ class HealthStatus:
 
 
 class Database:
-    def __init__(self, config: Config):
+    def __init__(
+        self,
+        config: Config,
+    ):
         self.db_path = config.database_path
         self._init_db()
 
     @contextmanager
-    def _connection(self) -> Iterator[sqlite3.Connection]:
+    def _connection(
+        self,
+    ) -> Iterator[sqlite3.Connection]:
         conn = sqlite3.connect(self.db_path)
         conn.row_factory = sqlite3.Row
         try:
@@ -40,10 +45,11 @@ class Database:
         finally:
             conn.close()
 
-    def _init_db(self) -> None:
+    def _init_db(
+        self,
+    ) -> None:
         with self._connection() as conn:
-            conn.executescript(
-                """
+            conn.executescript("""
                 CREATE TABLE IF NOT EXISTS processed_runs (
                     run_id TEXT PRIMARY KEY,
                     video_url TEXT NOT NULL,
@@ -75,11 +81,15 @@ class Database:
                     skipped_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 );
 
+                CREATE TABLE IF NOT EXISTS meta (
+                    key TEXT PRIMARY KEY,
+                    value TEXT
+                );
+
                 -- Initialize health log if empty
                 INSERT OR IGNORE INTO health_log (id, status, consecutive_failures)
                 VALUES (1, 'healthy', 0);
-            """
-            )
+            """)
 
     def _exists_in(
         self,
@@ -91,6 +101,27 @@ class Database:
                 f"SELECT 1 FROM {table} WHERE run_id = ?", (run_id,)
             ).fetchone()
             return row is not None
+
+    def get_meta(
+        self,
+        key: str,
+    ) -> str | None:
+        with self._connection() as conn:
+            row = conn.execute(
+                "SELECT value FROM meta WHERE key = ?", (key,)
+            ).fetchone()
+            return row["value"] if row is not None else None
+
+    def set_meta(
+        self,
+        key: str,
+        value: str,
+    ) -> None:
+        with self._connection() as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)",
+                (key, value),
+            )
 
     def is_processed(
         self,
@@ -111,7 +142,10 @@ class Database:
         return self._exists_in("skipped_runs", run_id)
 
     def mark_skipped(
-        self, run_id: str, video_url: str, reason: str | None = None
+        self,
+        run_id: str,
+        video_url: str,
+        reason: str | None = None,
     ) -> None:
         with self._connection() as conn:
             conn.execute(
@@ -123,7 +157,12 @@ class Database:
             )
             conn.execute("DELETE FROM failed_queue WHERE run_id = ?", (run_id,))
 
-    def mark_processed(self, run_id: str, video_url: str, archived_url: str) -> None:
+    def mark_processed(
+        self,
+        run_id: str,
+        video_url: str,
+        archived_url: str,
+    ) -> None:
         with self._connection() as conn:
             conn.execute(
                 """
@@ -135,7 +174,10 @@ class Database:
             conn.execute("DELETE FROM failed_queue WHERE run_id = ?", (run_id,))
 
     def add_to_queue(
-        self, run_id: str, video_url: str, error_message: str | None = None
+        self,
+        run_id: str,
+        video_url: str,
+        error_message: str | None = None,
     ) -> None:
         with self._connection() as conn:
             conn.execute(
@@ -150,7 +192,10 @@ class Database:
                 (run_id, video_url, error_message),
             )
 
-    def get_queue(self, limit: int = 10) -> list[FailedRun]:
+    def get_queue(
+        self,
+        limit: int = 10,
+    ) -> list[FailedRun]:
         with self._connection() as conn:
             rows = conn.execute(
                 """
@@ -193,25 +238,32 @@ class Database:
             row = conn.execute("SELECT COUNT(*) as cnt FROM failed_queue").fetchone()
             return row["cnt"]
 
-    def remove_from_queue(self, run_id: str) -> None:
+    def remove_from_queue(
+        self,
+        run_id: str,
+    ) -> None:
         with self._connection() as conn:
             conn.execute("DELETE FROM failed_queue WHERE run_id = ?", (run_id,))
 
-    def get_health(self) -> HealthStatus:
+    def get_health(
+        self,
+    ) -> HealthStatus:
         with self._connection() as conn:
-            row = conn.execute(
-                """
+            row = conn.execute("""
                 SELECT status, consecutive_failures, last_check
                 FROM health_log WHERE id = 1
-                """
-            ).fetchone()
+                """).fetchone()
             return HealthStatus(
                 status=row["status"],
                 consecutive_failures=row["consecutive_failures"],
                 last_check=datetime.fromisoformat(row["last_check"]),
             )
 
-    def update_health(self, status: str, consecutive_failures: int) -> None:
+    def update_health(
+        self,
+        status: str,
+        consecutive_failures: int,
+    ) -> None:
         with self._connection() as conn:
             conn.execute(
                 """
@@ -222,28 +274,28 @@ class Database:
                 (status, consecutive_failures),
             )
 
-    def increment_failures(self) -> int:
+    def increment_failures(
+        self,
+    ) -> int:
         with self._connection() as conn:
-            conn.execute(
-                """
+            conn.execute("""
                 UPDATE health_log
                 SET consecutive_failures = consecutive_failures + 1,
                     last_check = CURRENT_TIMESTAMP
                 WHERE id = 1
-                """
-            )
+                """)
             row = conn.execute(
                 "SELECT consecutive_failures FROM health_log WHERE id = 1"
             ).fetchone()
             return row["consecutive_failures"]
 
-    def reset_failures(self) -> None:
+    def reset_failures(
+        self,
+    ) -> None:
         with self._connection() as conn:
-            conn.execute(
-                """
+            conn.execute("""
                 UPDATE health_log
                 SET status = 'healthy', consecutive_failures = 0,
                     last_check = CURRENT_TIMESTAMP
                 WHERE id = 1
-                """
-            )
+                """)

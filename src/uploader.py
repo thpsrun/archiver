@@ -2,7 +2,15 @@ import logging
 import time
 from pathlib import Path
 
-from b2sdk.v2 import AbstractProgressListener, B2Api, Bucket, InMemoryAccountInfo
+from b2sdk.v2 import (
+    AbstractProgressListener,
+    B2Api,
+    Bucket,
+    DownloadVersion,
+    FileVersion,
+    InMemoryAccountInfo,
+)
+from b2sdk.v2.exception import FileNotPresent
 
 from src.config import Config
 
@@ -110,12 +118,17 @@ class UploadError(Exception):
 
 
 class Uploader:
-    def __init__(self, config: Config):
+    def __init__(
+        self,
+        config: Config,
+    ):
         self.config = config
         self._api: B2Api | None = None
         self._bucket: Bucket | None = None
 
-    def _get_api(self) -> B2Api:
+    def _get_api(
+        self,
+    ) -> B2Api:
         if self._api is None:
             info = InMemoryAccountInfo()
             self._api = B2Api(info)  # type: ignore
@@ -126,13 +139,38 @@ class Uploader:
             )
         return self._api
 
-    def _get_bucket(self) -> Bucket:
+    def _get_bucket(
+        self,
+    ) -> Bucket:
         if self._bucket is None:
             api = self._get_api()
             self._bucket = api.get_bucket_by_name(self.config.b2_bucket_name)  # type: ignore
         return self._bucket  # type: ignore
 
-    def upload(self, file_path: str, run_id: str) -> str:
+    def get_existing_file(
+        self,
+        run_id: str,
+    ) -> DownloadVersion | None:
+        file_name = f"{run_id}.mp4"
+        try:
+            return self._get_bucket().get_file_info_by_name(file_name)  # type: ignore
+        except FileNotPresent:
+            return None
+
+    def build_archive_url(
+        self,
+        run_id: str,
+        file_ver: DownloadVersion | FileVersion,
+    ) -> str:
+        if self.config.archive_url:
+            return f"{self.config.archive_url}/{run_id}.mp4"
+        return self._get_api().get_download_url_for_fileid(file_ver.id_)  # type: ignore
+
+    def upload(
+        self,
+        file_path: str,
+        run_id: str,
+    ) -> str:
         path = Path(file_path)
         if not path.exists():
             raise UploadError(f"File does not exist: {file_path}")
@@ -159,10 +197,7 @@ class Uploader:
                 progress_listener=progress_listener,
             )
 
-            if self.config.archive_url:
-                download_url = f"{self.config.archive_url}/{run_id}.mp4"
-            else:
-                download_url = self._api.get_download_url_for_fileid(file_ver.id_)  # type: ignore
+            download_url = self.build_archive_url(run_id, file_ver)
 
             logger.info("Upload successful: %s", download_url)
             return download_url
@@ -170,7 +205,10 @@ class Uploader:
             logger.exception("Upload failed for %s", file_path)
             raise UploadError(f"Failed to upload to B2: {e}") from e
 
-    def cleanup(self, file_path: str) -> None:
+    def cleanup(
+        self,
+        file_path: str,
+    ) -> None:
         try:
             path = Path(file_path)
             if path.exists():

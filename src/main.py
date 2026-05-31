@@ -9,7 +9,7 @@ from pathlib import Path
 
 import sentry_sdk
 
-from src.api_client import APIClient, APIError, Run
+from src.api_client import APIAuthError, APIClient, APIError, Run
 from src.config import Config, load_config
 from src.database import Database
 from src.downloader import Downloader, is_cookie_related_failure
@@ -26,7 +26,9 @@ RESTART_WINDOW_START = dt_time(4, 0)  # 4:00 AM UTC
 RESTART_WINDOW_END = dt_time(4, 30)  # 4:30 AM UTC
 
 
-def init_sentry(config: Config) -> None:
+def init_sentry(
+    config: Config,
+) -> None:
     if config.sentry_dsn:
         sentry_sdk.init(
             dsn=config.sentry_dsn,
@@ -50,6 +52,24 @@ def process_run(
         scope.set_tag("run_id", run.id)
         scope.set_extra("video_url", run.video_url)
 
+        existing = uploader.get_existing_file(run.id)
+        if existing is not None:
+            archive_url = uploader.build_archive_url(run.id, existing)
+            logger.info(
+                "Run %s already in B2; backfilling arch_video (no re-upload)",
+                run.id,
+            )
+            if not config.skip_api:
+                try:
+                    api.update_archive_url(run.id, archive_url)
+                except APIAuthError:
+                    raise
+                except APIError as e:
+                    logger.error("Backfill update failed for run %s: %s", run.id, e)
+                    sentry_sdk.capture_exception(e)
+            db.mark_processed(run.id, run.video_url, archive_url)
+            return True, False
+
         result = downloader.download(run.id, run.video_url)
 
         if not result.success:
@@ -70,7 +90,14 @@ def process_run(
                 )
             return False, result.is_youtube_blocked
 
-        if _upload_and_finalize(run, result.file_path, uploader, db, config):
+        if _upload_and_finalize(
+            run,
+            result.file_path,
+            uploader,
+            api,
+            db,
+            config,
+        ):
             db.reset_failures()
             return True, False
 
@@ -152,10 +179,17 @@ def main_loop(
                 time.sleep(60)
                 continue
 
+            if runs:
+                last_seen = db.get_meta("last_seen_run_id")
+                if runs[0].id != last_seen:
+                    db.set_meta("last_seen_run_id", runs[0].id)
+                    logger.debug("New newest run id: %s", runs[0].id)
+
             pending_runs = [
                 r
                 for r in runs
-                if not db.is_processed(r.id)
+                if not r.arch_video
+                and not db.is_processed(r.id)
                 and not db.is_in_queue(r.id)
                 and not db.is_skipped(r.id)
             ]
@@ -215,6 +249,10 @@ def main_loop(
         except KeyboardInterrupt:
             logger.info("Shutting down...")
             break
+        except APIAuthError as e:
+            logger.error("API auth failed (401) - stopping the bot: %s", e)
+            sentry_sdk.capture_exception(e)
+            sys.exit(1)
         except Exception as e:
             logger.exception("Unexpected error in main loop")
             sentry_sdk.capture_exception(e)
@@ -224,7 +262,9 @@ def main_loop(
 TEST_VIDEOS_PATH = Path("test_videos.txt")
 
 
-def load_test_videos(path: Path) -> list[Run]:
+def load_test_videos(
+    path: Path,
+) -> list[Run]:
     runs: list[Run] = []
     with open(path, encoding="utf-8") as f:
         for i, line in enumerate(f, start=1):
@@ -252,6 +292,7 @@ def _upload_and_finalize(
     run: Run,
     file_path: str | None,
     uploader: Uploader,
+    api: APIClient,
     db: Database,
     config: Config,
 ) -> bool:
@@ -271,9 +312,9 @@ def _upload_and_finalize(
 
             if not config.skip_api:
                 try:
-                    # api.update_archive_url(run.id, archive_url)
-                    # TODO: RE-NABLE BEFORE PROD.
-                    pass
+                    api.update_archive_url(run.id, archive_url)
+                except APIAuthError:
+                    raise
                 except APIError as e:
                     logger.error("API update failed for run %s: %s", run.id, e)
                     sentry_sdk.capture_exception(e)
@@ -291,6 +332,7 @@ def _process_videos_with_pipeline(
     pending: list[Run],
     downloader: Downloader,
     uploader: Uploader,
+    api: APIClient,
     db: Database,
     config: Config,
     label: str = "Test mode",
@@ -355,6 +397,7 @@ def _process_videos_with_pipeline(
                 run,
                 result.file_path,
                 uploader,
+                api,
                 db,
                 config,
             )
@@ -403,6 +446,7 @@ def run_test_mode(
         pending,
         downloader,
         uploader,
+        api,
         db,
         config,
         label="Initial pass",
@@ -447,6 +491,7 @@ def run_test_mode(
             retry_runs,
             downloader,
             uploader,
+            api,
             db,
             config,
             label=f"Retry pass {retry_pass + 1}",
