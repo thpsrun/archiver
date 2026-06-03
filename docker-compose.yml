@@ -4,21 +4,19 @@ services:
       context: .
       dockerfile: Dockerfile
       args:
-        UID: 1000
-        GID: 1000
+        UID: 1001
+        GID: 1001
     container_name: archiver
     restart: unless-stopped
     env_file:
       - .env
     volumes:
-      #- ./data:/app/data
-      - /mnt/Videos/uploads:/app/data
+      - ./data:/app/data
     environment:
       - TZ=UTC
     depends_on:
       - bgutil-provider
     networks:
-      - thpsrun
       - archiver-net
 
   bgutil-provider:
@@ -30,8 +28,5 @@ services:
       - archiver-net
 
 networks:
-  thpsrun:
-    external: true
-    name: website_thpsrun
   archiver-net:
     driver: bridge
