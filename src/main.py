@@ -52,6 +52,15 @@ def process_run(
         scope.set_tag("run_id", run.id)
         scope.set_extra("video_url", run.video_url)
 
+        if not config.skip_api:
+            current = api.get_run(run.id)
+            if current is not None and current.arch_video:
+                logger.info(
+                    "Run %s already has arch_video; skipping download", run.id
+                )
+                db.mark_processed(run.id, run.video_url, current.arch_video)
+                return True, False
+
         existing = uploader.get_existing_file(run.id)
         if existing is not None:
             archive_url = uploader.build_archive_url(run.id, existing)

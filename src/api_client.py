@@ -5,7 +5,7 @@ from typing import Any
 
 import requests
 
-from .config import Config
+from src.config import Config
 
 logger = logging.getLogger(__name__)
 
@@ -112,6 +112,30 @@ class APIClient:
             return response
 
         raise APIError("Unexpected retry loop exit")
+
+    def get_run(
+        self,
+        run_id: str,
+    ) -> Run | None:
+        """Fetch a single run's current state from the API."""
+        try:
+            response = self._request("GET", f"/runs/{run_id}")
+        except APIAuthError:
+            raise
+        except APIError as e:
+            logger.warning(
+                "Could not fetch run %s for pre-download check: %s", run_id, e
+            )
+            return None
+
+        item = response.json()
+        video_url = item.get("video")
+        arch_video = item.get("arch_video")
+
+        if not video_url:
+            return None
+
+        return Run(id=run_id, video_url=video_url, arch_video=arch_video)
 
     def get_pending_runs(
         self,
