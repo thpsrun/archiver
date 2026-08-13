@@ -9,6 +9,7 @@ from b2sdk.v2 import (
     DownloadVersion,
     FileVersion,
     InMemoryAccountInfo,
+    UnfinishedLargeFile,
 )
 from b2sdk.v2.exception import FileNotPresent
 
@@ -18,7 +19,7 @@ logger = logging.getLogger(__name__)
 
 
 def _format_bytes(
-    num_bytes: int | float,
+    num_bytes: float,
 ) -> str:
     for unit in ("B", "KB", "MB", "GB", "TB"):
         if abs(num_bytes) < 1024:
@@ -153,9 +154,31 @@ class Uploader:
     ) -> DownloadVersion | None:
         file_name = f"{run_id}.mp4"
         try:
-            return self._get_bucket().get_file_info_by_name(file_name)  # type: ignore
+            return self._get_bucket().get_file_info_by_name(file_name)
         except FileNotPresent:
             return None
+
+    def list_unfinished_large_files(
+        self,
+    ) -> list[UnfinishedLargeFile]:
+        """List all interrupted (unfinished) large-file uploads in the bucket.
+
+        Returns:
+            files (list[UnfinishedLargeFile]): Every unfinished large file
+                currently present in the configured bucket.
+        """
+        return list(self._get_bucket().list_unfinished_large_files())
+
+    def cancel_large_file(
+        self,
+        file_id: str,
+    ) -> None:
+        """Cancel an unfinished large file, reclaiming its storage.
+
+        Arguments:
+            file_id (str): The B2 file id of the unfinished large file.
+        """
+        self._get_bucket().cancel_large_file(file_id)
 
     def build_archive_url(
         self,
@@ -164,7 +187,7 @@ class Uploader:
     ) -> str:
         if self.config.archive_url:
             return f"{self.config.archive_url}/{run_id}.mp4"
-        return self._get_api().get_download_url_for_fileid(file_ver.id_)  # type: ignore
+        return self._get_api().get_download_url_for_fileid(file_ver.id_)
 
     def upload(
         self,

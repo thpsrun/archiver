@@ -1,10 +1,10 @@
 import sqlite3
+from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Iterator
 
-from .config import Config
+from src.config import Config
 
 
 @dataclass
@@ -123,6 +123,24 @@ class Database:
                 (key, value),
             )
 
+    def get_video_url(
+        self,
+        run_id: str,
+    ) -> str | None:
+        """Look up a run's source video URL from any local record.
+
+        Arguments:
+            run_id (str): The run whose source URL to find.
+        """
+        with self._connection() as conn:
+            for table in ("failed_queue", "processed_runs", "skipped_runs"):
+                row = conn.execute(
+                    f"SELECT video_url FROM {table} WHERE run_id = ?", (run_id,)
+                ).fetchone()
+                if row is not None:
+                    return row["video_url"]
+        return None
+
     def is_processed(
         self,
         run_id: str,
@@ -237,13 +255,6 @@ class Database:
         with self._connection() as conn:
             row = conn.execute("SELECT COUNT(*) as cnt FROM failed_queue").fetchone()
             return row["cnt"]
-
-    def remove_from_queue(
-        self,
-        run_id: str,
-    ) -> None:
-        with self._connection() as conn:
-            conn.execute("DELETE FROM failed_queue WHERE run_id = ?", (run_id,))
 
     def get_health(
         self,

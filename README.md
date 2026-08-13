@@ -25,8 +25,8 @@ As such, this project is mainly meant for thps.run support, but it is open-sourc
     Log into a burner YouTube account, then use:
     `./yt-dlp --cookies-from-browser chrome --cookies cookies.txt`
 
-   > [!TIP]
-   > Use a burner Google account for this. YouTube may flag the account for automated activity, which is very bad if you are using your real account.
+> [!TIP]
+> Use a burner Google account for this. YouTube may flag the account for automated activity, which is very bad if you are using your real account.
 
 3. **Start the bot**
 
@@ -43,8 +43,20 @@ As such, this project is mainly meant for thps.run support, but it is open-sourc
 ## Testing
 You can make a file called `test_videos.txt` with a YouTube video on each line; when you start the bot it will enter a test mode to make sure the bot works without GET'ing information from the thps.run API. Once it downloads the videos, it will shutdown.
 
+## Force Re-upload
+To re-archive specific runs (e.g. a corrupt or wrong archive that needs replacing), pass their thps.run/SRC IDs to `--forceupload` as a comma-separated list. This re-downloads each source video and re-uploads it to B2, **overwriting** any existing archive, and updates the run's `arch_video` in the API:
+
+```
+docker exec youtube-archiver python -m src.main --forceupload srcid123,srcid234,srcid456
+```
+
+`docker exec` runs this as a separate one-shot process inside the already-running container, so the polling loop keeps running untouched (no restart needed). Each ID is reported independently; a failure (unresolvable ID, download or upload error) leaves the existing archive in place and processing continues with the rest.
+
+> [!NOTE]
+> The force process shares the container's SQLite database and cookies with the running loop. This is fine for a handful of IDs, but might get weird if you got a bunch AND you are actively ingesting new runs.
+
 ## Auto-Updating yt-dlp
-The Docker entrypoint upgrades yt-dlp on every container start. The bot self-restarts nightly (4:00–4:30 AM UTC) when idle, so yt-dlp stays current without manual intervention.
+The Docker entrypoint upgrades yt-dlp on every container start. The bot self-restarts nightly (4:00–4:30 AM UTC) when idle.
 
 ## Cookie Maintenance
 YouTube cookies expire periodically. When downloads start failing with 403 or bot-detection errors, re-export `data/cookies.txt` from your browser and restart the container: `docker compose restart archiver`

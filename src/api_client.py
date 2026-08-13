@@ -85,6 +85,11 @@ class APIClient:
                 )
             if status == 429:
                 retry_after = int(response.headers.get("Retry-After", "5"))
+                if attempt == max_retries - 1:
+                    raise APIError(
+                        f"Rate limited (429) on {method} {endpoint} "
+                        f"after {max_retries} attempts"
+                    )
                 logger.warning(
                     "429 rate limited on %s %s; honoring Retry-After=%ds",
                     method,

@@ -3,19 +3,27 @@ import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
-from .config import Config
+from src.config import Config
 
 logger = logging.getLogger(__name__)
 
-BLOCKING_PATTERNS = [
+# Auth / bot-detection signals that a fresh cookie export can clear.
+COOKIE_PATTERNS = [
     "Sign in to confirm",
     "Sign in to confirm your age",
     "HTTP Error 403",
-    "HTTP Error 429",
-    "too many requests",
     "bot detection",
     "confirm you're not a bot",
 ]
+
+# Rate-limiting signals: transient, and NOT fixed by refreshing cookies.
+RATE_LIMIT_PATTERNS = [
+    "HTTP Error 429",
+    "too many requests",
+]
+
+# Any of these in yt-dlp output means YouTube is actively blocking the download.
+BLOCKING_PATTERNS = COOKIE_PATTERNS + RATE_LIMIT_PATTERNS
 
 PERMANENT_FAILURE_PATTERNS = [
     "This video is unavailable",
@@ -32,11 +40,6 @@ PERMANENT_FAILURE_PATTERNS = [
     "This video does not exist",
     "is not a valid URL",
 ]
-
-
-COOKIE_PATTERNS = {
-    p for p in BLOCKING_PATTERNS if p not in ("HTTP Error 429", "too many requests")
-}
 
 
 def is_cookie_related_failure(
@@ -66,7 +69,11 @@ class Downloader:
         self.downloads_dir = Path(config.downloads_dir)
         self.downloads_dir.mkdir(parents=True, exist_ok=True)
 
-    def download(self, run_id: str, video_url: str) -> DownloadResult:
+    def download(
+        self,
+        run_id: str,
+        video_url: str,
+    ) -> DownloadResult:
         output_path = self.downloads_dir / f"{run_id}.mp4"
 
         if output_path.exists():
@@ -90,7 +97,7 @@ class Downloader:
                 cmd,
                 capture_output=True,
                 text=True,
-                timeout=3600,  # 1 hour timeout for long videos
+                timeout=3600,
             )
 
             combined_output = result.stdout + result.stderr

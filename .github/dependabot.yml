@@ -1,29 +1,37 @@
 version: 2
 updates:
   - package-ecosystem: "pip"
-    directory: "/"
+    directory: "~/archiver/"
     schedule:
       interval: "weekly"
     groups:
-      ytdlp:
+      pip-version-updates:
         applies-to: version-updates
-        patterns:
-          - "yt-dlp*"
-          - "bgutil-ytdlp*"
-      support-dependencies:
-        applies-to: version-updates
-        patterns:
-          - "*"
-        exclude-patterns:
-          - "yt-dlp*"
-          - "bgutil-ytdlp*"
-
-  - package-ecosystem: "docker"
-    directory: "/"
-    schedule:
-      interval: "weekly"
+        patterns: ["*"]
+      pip-security-updates:
+        applies-to: security-updates
+        patterns: ["*"]
 
   - package-ecosystem: "github-actions"
-    directory: "/"
+    directory: "~/archiver/"
     schedule:
       interval: "weekly"
+    groups:
+      actions-version-updates:
+        applies-to: version-updates
+        patterns: ["*"]
+      actions-security-updates:
+        applies-to: security-updates
+        patterns: ["*"]
+
+  - package-ecosystem: "docker"
+    directory: "~/archiver/"
+    schedule:
+      interval: "weekly"
+    groups:
+      docker-version-updates:
+        applies-to: version-updates
+        patterns: ["*"]
+      docker-security-updates:
+        applies-to: security-updates
+        patterns: ["*"]

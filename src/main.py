@@ -1,4 +1,4 @@
-import concurrent.futures
+import argparse
 import logging
 import random
 import sys
@@ -22,13 +22,179 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 RECOVERY_WAIT_MINUTES = 15
-RESTART_WINDOW_START = dt_time(4, 0)  # 4:00 AM UTC
-RESTART_WINDOW_END = dt_time(4, 30)  # 4:30 AM UTC
+RESTART_WINDOW_START = dt_time(4, 0)
+RESTART_WINDOW_END = dt_time(4, 30)
+TEST_VIDEOS_PATH = Path("test_videos.txt")
+
+
+def _run_id_from_file_name(
+    file_name: str,
+) -> str | None:
+    """Extract the run id from a B2 object name of the form '{run_id}.mp4'.
+
+    Arguments:
+        file_name (str): The B2 object name.
+
+    Returns:
+        run_id (str | None): The run id, or None if the name is not '{run_id}.mp4'.
+    """
+    if not file_name.endswith(".mp4"):
+        return None
+    run_id = file_name[: -len(".mp4")]
+
+    return run_id or None
+
+
+def _resolve_run(
+    run_id: str,
+    api: APIClient,
+    db: Database,
+    config: Config,
+) -> Run | None:
+    """Resolve a run's source video URL, thps.run API first then local DB.
+
+    Arguments:
+        run_id (str): The run to resolve.
+        api (APIClient): The thps.run API client.
+        db (Database): The local database.
+        config (Config): Runtime configuration.
+    """
+    if not config.skip_api:
+        run = api.get_run(run_id)
+        if run is not None:
+            return run
+
+    video_url = db.get_video_url(run_id)
+    if video_url:
+        return Run(id=run_id, video_url=video_url)
+    return None
+
+
+def recover_unfinished_uploads(
+    db: Database,
+    downloader: Downloader,
+    uploader: Uploader,
+    api: APIClient,
+    config: Config,
+) -> None:
+    """Re-download and re-upload any interrupted B2 large-file uploads.
+
+    Lists the bucket's unfinished large files, groups them by run, resolves each run's source URL,
+    cancels its stale state, then re-runs the normal download-to-upload pipeline.
+
+    Arguments:
+        db (Database): The local database.
+        downloader (Downloader): The yt-dlp downloader.
+        uploader (Uploader): The B2 uploader.
+        api (APIClient): The thps.run API client.
+        config (Config): Runtime configuration.
+    """
+    try:
+        unfinished = uploader.list_unfinished_large_files()
+    except Exception as e:
+        logger.exception("Unfinished-upload sweep: failed to list partials")
+        sentry_sdk.capture_exception(e)
+        return
+
+    if not unfinished:
+        logger.info("Unfinished-upload sweep: none found")
+        return
+
+    by_run: dict[str, list] = {}
+    for uf in unfinished:
+        run_id = _run_id_from_file_name(uf.file_name)
+        if run_id is None:
+            logger.warning(
+                "Unfinished-upload sweep: skipping unexpected name %s", uf.file_name
+            )
+            continue
+        by_run.setdefault(run_id, []).append(uf)
+
+    logger.info(
+        "Unfinished-upload sweep: %d partial(s) across %d run(s)",
+        len(unfinished),
+        len(by_run),
+    )
+
+    recovered = 0
+    unresolved = 0
+    failed = 0
+
+    for run_id, partials in by_run.items():
+        run = _resolve_run(run_id, api, db, config)
+        if run is None:
+            unresolved += 1
+            logger.warning(
+                "Unfinished-upload sweep: cannot resolve run %s; leaving %d in place...",
+                run_id,
+                len(partials),
+            )
+            sentry_sdk.capture_message(
+                f"Unfinished B2 upload for run {run_id} could not be resolved "
+                "to a source URL; partial left in place",
+                level="warning",
+            )
+            continue
+
+        for uf in partials:
+            try:
+                uploader.cancel_large_file(uf.file_id)
+            except Exception as e:
+                logger.warning(
+                    "Unfinished-upload sweep: failed to cancel %s: %s", uf.file_id, e
+                )
+                sentry_sdk.capture_exception(e)
+
+        logger.info("Unfinished-upload sweep: recovering run %s", run_id)
+        success, _ = process_run(run, downloader, uploader, api, db, config)
+        if success:
+            recovered += 1
+        else:
+            failed += 1
+            logger.warning(
+                "Unfinished-upload sweep: run %s did not complete; queued for retry",
+                run_id,
+            )
+
+    logger.info(
+        "Unfinished-upload sweep complete: %d recovered, %d unresolved, %d failed",
+        recovered,
+        unresolved,
+        failed,
+    )
+
+
+def maybe_daily_sweep(
+    db: Database,
+    downloader: Downloader,
+    uploader: Uploader,
+    api: APIClient,
+    config: Config,
+) -> None:
+    """Run the unfinished-upload sweep at most once per UTC day.
+
+    Arguments:
+        db (Database): The local database.
+        downloader (Downloader): The yt-dlp downloader.
+        uploader (Uploader): The B2 uploader.
+        api (APIClient): The thps.run API client.
+        config (Config): Runtime configuration.
+    """
+    today = datetime.now(timezone.utc).date().isoformat()
+    if db.get_meta("last_uf_sweep_date") == today:
+        return
+    recover_unfinished_uploads(db, downloader, uploader, api, config)
+    db.set_meta("last_uf_sweep_date", today)
 
 
 def init_sentry(
     config: Config,
 ) -> None:
+    """Initialize Sentry error reporting when a DSN is configured.
+
+    Arguments:
+        config (Config): Runtime configuration; init is skipped when sentry_dsn is unset.
+    """
     if config.sentry_dsn:
         sentry_sdk.init(
             dsn=config.sentry_dsn,
@@ -48,6 +214,16 @@ def process_run(
     db: Database,
     config: Config,
 ) -> tuple[bool, bool]:
+    """Run one submission end to end: skip/backfill checks, download, upload, finalize.
+
+    Arguments:
+        run (Run): The run to process (id + source video_url).
+        downloader (Downloader): The yt-dlp downloader.
+        uploader (Uploader): The B2 uploader.
+        api (APIClient): The thps.run API client.
+        db (Database): The local database.
+        config (Config): Runtime configuration.
+    """
     with sentry_sdk.new_scope() as scope:
         scope.set_tag("run_id", run.id)
         scope.set_extra("video_url", run.video_url)
@@ -55,9 +231,7 @@ def process_run(
         if not config.skip_api:
             current = api.get_run(run.id)
             if current is not None and current.arch_video:
-                logger.info(
-                    "Run %s already has arch_video; skipping download", run.id
-                )
+                logger.info("Run %s already has arch_video; skipping download", run.id)
                 db.mark_processed(run.id, run.video_url, current.arch_video)
                 return True, False
 
@@ -120,6 +294,15 @@ def attempt_recovery(
     api: APIClient,
     config: Config,
 ) -> bool:
+    """Retry the oldest queued run to check whether downloads are working again.
+
+    Arguments:
+        db (Database): The local database.
+        downloader (Downloader): The yt-dlp downloader.
+        uploader (Uploader): The B2 uploader.
+        api (APIClient): The thps.run API client.
+        config (Config): Runtime configuration.
+    """
     queue = db.get_queue(limit=1)
     if not queue:
         logger.info("Recovery: no items in queue, resuming...")
@@ -161,6 +344,15 @@ def main_loop(
     downloader: Downloader,
     uploader: Uploader,
 ) -> None:
+    """Poll the API for verified runs and process them forever, with failure recovery.
+
+    Arguments:
+        config (Config): Runtime configuration.
+        db (Database): The local database.
+        api (APIClient): The thps.run API client.
+        downloader (Downloader): The yt-dlp downloader.
+        uploader (Uploader): The B2 uploader.
+    """
     while True:
         try:
             health = db.get_health()
@@ -208,6 +400,7 @@ def main_loop(
 
                 now = datetime.now(timezone.utc).time()
                 if RESTART_WINDOW_START <= now <= RESTART_WINDOW_END:
+                    maybe_daily_sweep(db, downloader, uploader, api, config)
                     logger.info(
                         "Maintenance window, no work pending - restarting for updates"
                     )
@@ -220,20 +413,19 @@ def main_loop(
                     run, downloader, uploader, api, db, config
                 )
 
-                if not success:
-                    if not db.is_skipped(run.id):
-                        failures = db.increment_failures()
-                        logger.warning(
-                            "Failure count: %d/%d",
-                            failures,
-                            config.consecutive_failure_threshold,
-                        )
+                if not success and not db.is_skipped(run.id):
+                    failures = db.increment_failures()
+                    logger.warning(
+                        "Failure count: %d/%d",
+                        failures,
+                        config.consecutive_failure_threshold,
+                    )
 
-                        if is_blocked:
-                            sentry_sdk.capture_message(
-                                f"YouTube blocking detected, failure count: {failures}",
-                                level="error",
-                            )
+                    if is_blocked:
+                        sentry_sdk.capture_message(
+                            f"YouTube blocking detected, failure count: {failures}",
+                            level="error",
+                        )
 
                 if run != pending_runs[-1]:
                     delay = random.uniform(
@@ -268,12 +460,10 @@ def main_loop(
             time.sleep(60)
 
 
-TEST_VIDEOS_PATH = Path("test_videos.txt")
-
-
 def load_test_videos(
     path: Path,
 ) -> list[Run]:
+    """Load '{run_id},{video_url}' lines from a test-videos file."""
     runs: list[Run] = []
     with open(path, encoding="utf-8") as f:
         for i, line in enumerate(f, start=1):
@@ -304,37 +494,53 @@ def _upload_and_finalize(
     api: APIClient,
     db: Database,
     config: Config,
+    queue_on_failure: bool = True,
 ) -> bool:
+    """Upload a downloaded file to B2, write the archive URL back, and record the run.
+
+    Arguments:
+        run (Run): The run being finalized.
+        file_path (str | None): Local path to the downloaded file; None is a no-op.
+        uploader (Uploader): The B2 uploader.
+        api (APIClient): The thps.run API client.
+        db (Database): The local database.
+        config (Config): Runtime configuration.
+        queue_on_failure (bool): When True, an upload failure re-queues the run for
+            retry; force re-uploads pass False to report but not re-queue.
+    """
     with sentry_sdk.new_scope() as scope:
         scope.set_tag("run_id", run.id)
         scope.set_extra("video_url", run.video_url)
 
-        if file_path:
-            try:
-                archive_url = uploader.upload(file_path, run.id)
-            except UploadError as e:
-                db.add_to_queue(run.id, run.video_url, str(e))
-                sentry_sdk.capture_exception(e)
-                return False
-            finally:
-                uploader.cleanup(file_path)
-
-            if not config.skip_api:
-                try:
-                    api.update_archive_url(run.id, archive_url)
-                except APIAuthError:
-                    raise
-                except APIError as e:
-                    logger.error("API update failed for run %s: %s", run.id, e)
-                    sentry_sdk.capture_exception(e)
-                    db.mark_processed(run.id, run.video_url, archive_url)
-                    return False
-
-            db.mark_processed(run.id, run.video_url, archive_url)
-            logger.info("Successfully processed run %s", run.id)
-            return True
-        else:
+        if not file_path:
             return False
+
+        try:
+            archive_url = uploader.upload(file_path, run.id)
+        except UploadError as e:
+            # Force re-uploads pass queue_on_failure=False: report the failure
+            # but don't add the run to the retry queue.
+            if queue_on_failure:
+                db.add_to_queue(run.id, run.video_url, str(e))
+            sentry_sdk.capture_exception(e)
+            return False
+        finally:
+            uploader.cleanup(file_path)
+
+        if not config.skip_api:
+            try:
+                api.update_archive_url(run.id, archive_url)
+            except APIAuthError:
+                raise
+            except APIError as e:
+                logger.error("API update failed for run %s: %s", run.id, e)
+                sentry_sdk.capture_exception(e)
+                db.mark_processed(run.id, run.video_url, archive_url)
+                return False
+
+        db.mark_processed(run.id, run.video_url, archive_url)
+        logger.info("Successfully processed run %s", run.id)
+        return True
 
 
 def _process_videos_with_pipeline(
@@ -346,80 +552,78 @@ def _process_videos_with_pipeline(
     config: Config,
     label: str = "Test mode",
 ) -> tuple[int, int, int]:
+    """Download and archive each run in sequence, tallying the outcomes.
+
+    Arguments:
+        pending (list[Run]): The runs to process, in order.
+        downloader (Downloader): The yt-dlp downloader.
+        uploader (Uploader): The B2 uploader.
+        api (APIClient): The thps.run API client.
+        db (Database): The local database.
+        config (Config): Runtime configuration.
+        label (str): Human-readable phase label for log lines.
+
+    """
     total = len(pending)
     succeeded = 0
     failed = 0
     skipped = 0
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
-        upload_future: concurrent.futures.Future[bool] | None = None
+    for i, run in enumerate(pending, start=1):
+        logger.info(
+            "[%d/%d] %s - processing run %s: %s",
+            i,
+            total,
+            label,
+            run.id,
+            run.video_url,
+        )
 
-        def results() -> None:
-            nonlocal succeeded, failed, upload_future
-            if upload_future is not None:
-                if upload_future.result():
-                    succeeded += 1
-                else:
-                    failed += 1
-                upload_future = None
+        with sentry_sdk.new_scope() as scope:
+            scope.set_tag("run_id", run.id)
+            scope.set_extra("video_url", run.video_url)
+            result = downloader.download(run.id, run.video_url)
 
-        for i, run in enumerate(pending, start=1):
-            logger.info(
-                "[%d/%d] %s - processing run %s: %s",
-                i,
-                total,
-                label,
-                run.id,
-                run.video_url,
-            )
-
-            with sentry_sdk.new_scope() as scope:
-                scope.set_tag("run_id", run.id)
-                scope.set_extra("video_url", run.video_url)
-                result = downloader.download(run.id, run.video_url)
-
-            if not result.success:
-                if result.is_permanent_failure:
-                    logger.warning(
-                        "[%d/%d] Permanent failure for run %s, skipping: %s",
-                        i,
-                        total,
-                        run.id,
-                        result.error_message,
-                    )
-                    db.mark_skipped(run.id, run.video_url, result.error_message)
-                    skipped += 1
-                else:
-                    db.add_to_queue(run.id, run.video_url, result.error_message)
-                    if result.is_youtube_blocked:
-                        sentry_sdk.capture_message(
-                            f"YouTube blocking detected for run {run.id}",
-                            level="warning",
-                        )
-                    failed += 1
-                continue
-
-            results()
-
-            upload_future = executor.submit(
-                _upload_and_finalize,
-                run,
-                result.file_path,
-                uploader,
-                api,
-                db,
-                config,
-            )
-
-            if i < total:
-                delay = random.uniform(
-                    config.delay_min_seconds,
-                    config.delay_max_seconds,
+        if not result.success:
+            if result.is_permanent_failure:
+                logger.warning(
+                    "[%d/%d] Permanent failure for run %s, skipping: %s",
+                    i,
+                    total,
+                    run.id,
+                    result.error_message,
                 )
-                logger.debug("Sleeping for %.1f seconds", delay)
-                time.sleep(delay)
+                db.mark_skipped(run.id, run.video_url, result.error_message)
+                skipped += 1
+            else:
+                db.add_to_queue(run.id, run.video_url, result.error_message)
+                if result.is_youtube_blocked:
+                    sentry_sdk.capture_message(
+                        f"YouTube blocking detected for run {run.id}",
+                        level="warning",
+                    )
+                failed += 1
+            continue
 
-        results()
+        if _upload_and_finalize(
+            run,
+            result.file_path,
+            uploader,
+            api,
+            db,
+            config,
+        ):
+            succeeded += 1
+        else:
+            failed += 1
+
+        if i < total:
+            delay = random.uniform(
+                config.delay_min_seconds,
+                config.delay_max_seconds,
+            )
+            logger.debug("Sleeping for %.1f seconds", delay)
+            time.sleep(delay)
 
     return succeeded, failed, skipped
 
@@ -427,6 +631,11 @@ def _process_videos_with_pipeline(
 def _check_cookie_fails(
     db: Database,
 ) -> bool:
+    """Report whether every queued failure looks cookie/auth related.
+
+    Arguments:
+        db (Database): The local database.
+    """
     errors = db.get_queue_errors()
     if not errors:
         return False
@@ -440,6 +649,15 @@ def run_test_mode(
     api: APIClient,
     config: Config,
 ) -> None:
+    """Process videos from test_videos.txt with retry passes, bypassing the poll loop.
+
+    Arguments:
+        db (Database): The local database.
+        downloader (Downloader): The yt-dlp downloader.
+        uploader (Uploader): The B2 uploader.
+        api (APIClient): The thps.run API client.
+        config (Config): Runtime configuration.
+    """
     runs = load_test_videos(TEST_VIDEOS_PATH)
     logger.info("Test mode: loaded %d video(s) from %s", len(runs), TEST_VIDEOS_PATH)
 
@@ -518,8 +736,137 @@ def run_test_mode(
     )
 
 
+def _parse_id_list(
+    raw: str,
+) -> list[str]:
+    """Split a comma-separated run-id string into a de-duped, ordered list.
+
+    Arguments:
+        raw (str): The raw --forceupload value, e.g. "vid1,vid2,vid1".
+    """
+    seen: set[str] = set()
+    ids: list[str] = []
+    for part in raw.split(","):
+        run_id = part.strip()
+        if run_id and run_id not in seen:
+            seen.add(run_id)
+            ids.append(run_id)
+    return ids
+
+
+def _force_one(
+    run: Run,
+    downloader: Downloader,
+    uploader: Uploader,
+    api: APIClient,
+    db: Database,
+    config: Config,
+) -> bool:
+    """Force one run through the pipeline and force uploads it.
+
+    Arguments:
+        run (Run): The resolved run (id + source video_url).
+        downloader (Downloader): The yt-dlp downloader.
+        uploader (Uploader): The B2 uploader.
+        api (APIClient): The thps.run API client.
+        db (Database): The local database.
+        config (Config): Runtime configuration.
+    """
+    with sentry_sdk.new_scope() as scope:
+        scope.set_tag("run_id", run.id)
+        scope.set_extra("video_url", run.video_url)
+
+        logger.info("Force upload: re-downloading run %s (%s)", run.id, run.video_url)
+        result = downloader.download(run.id, run.video_url)
+
+        if not result.success:
+            logger.error(
+                "Force upload: download failed for run %s: %s",
+                run.id,
+                result.error_message,
+            )
+            return False
+
+        if _upload_and_finalize(
+            run,
+            result.file_path,
+            uploader,
+            api,
+            db,
+            config,
+            queue_on_failure=False,
+        ):
+            logger.info("Force upload: run %s re-archived", run.id)
+            return True
+
+        logger.error("Force upload: upload/finalize failed for run %s", run.id)
+        return False
+
+
+def force_upload_runs(
+    run_ids: list[str],
+    downloader: Downloader,
+    uploader: Uploader,
+    api: APIClient,
+    db: Database,
+    config: Config,
+) -> int:
+    """Re-download and re-upload each run id, overwriting any existing archive.
+
+    Arguments:
+        run_ids (list[str]): The run ids to re-archive.
+        downloader (Downloader): The yt-dlp downloader.
+        uploader (Uploader): The B2 uploader.
+        api (APIClient): The thps.run API client.
+        db (Database): The local database.
+        config (Config): Runtime configuration.
+    """
+    succeeded = 0
+    failed = 0
+
+    for run_id in run_ids:
+        run = _resolve_run(run_id, api, db, config)
+        if run is None:
+            failed += 1
+            logger.error(
+                "Force upload: could not resolve source URL for run %s; skipping",
+                run_id,
+            )
+            continue
+
+        if _force_one(run, downloader, uploader, api, db, config):
+            succeeded += 1
+        else:
+            failed += 1
+
+    logger.info("Force upload complete: %d succeeded, %d failed", succeeded, failed)
+    return failed
+
+
+def parse_args(
+    argv: list[str] | None = None,
+) -> argparse.Namespace:
+    """Parse command-line arguments.
+
+    Arguments:
+        argv (list[str] | None): Argument vector, or None to use sys.argv.
+    """
+    parser = argparse.ArgumentParser(prog="archiver")
+    parser.add_argument(
+        "--forceupload",
+        metavar="IDS",
+        help=(
+            "Comma-separated run IDs to re-download and re-upload, "
+            "overwriting any existing archive."
+        ),
+    )
+    return parser.parse_args(argv)
+
+
 def main() -> None:
-    logger.info("Starting YouTube Archiver Bot")
+    args = parse_args()
+
+    logger.info("Starting thps.run YouTube Archiver Bot")
 
     config = load_config()
     init_sentry(config)
@@ -528,6 +875,19 @@ def main() -> None:
     api = APIClient(config)
     downloader = Downloader(config)
     uploader = Uploader(config)
+
+    if args.forceupload:
+        run_ids = _parse_id_list(args.forceupload)
+        if not run_ids:
+            logger.error("--forceupload given but no valid run IDs parsed")
+            sys.exit(2)
+        logger.info(
+            "Force upload requested for %d run(s): %s",
+            len(run_ids),
+            ", ".join(run_ids),
+        )
+        failed = force_upload_runs(run_ids, downloader, uploader, api, db, config)
+        sys.exit(1 if failed else 0)
 
     if TEST_VIDEOS_PATH.exists():
         logger.info("Found %s, entering test mode", TEST_VIDEOS_PATH)
