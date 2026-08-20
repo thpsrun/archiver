@@ -7,11 +7,14 @@ services:
       - NET_ADMIN
     devices:
       - /dev/net/tun:/dev/net/tun
+    dns:
+      - 8.8.8.8
+      - 1.1.1.1
     environment:
       - TS_AUTHKEY=${TS_AUTHKEY}
       - TS_EXTRA_ARGS=--exit-node=${TS_EXIT_NODE} --hostname=archiver-egress --advertise-tags=tag:egress
       - TS_USERSPACE=false
-      - TS_ACCEPT_DNS=true
+      - TS_ACCEPT_DNS=false
       - TS_AUTH_ONCE=true
       - TS_STATE_DIR=/var/lib/tailscale
       - TS_ENABLE_HEALTH_CHECK=true
