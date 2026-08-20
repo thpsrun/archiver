@@ -9,7 +9,7 @@ services:
       - /dev/net/tun:/dev/net/tun
     environment:
       - TS_AUTHKEY=${TS_AUTHKEY}
-      - TS_EXTRA_ARGS=--exit-node=${TS_EXIT_NODE} --hostname=archiver-egress
+      - TS_EXTRA_ARGS=--exit-node=${TS_EXIT_NODE} --hostname=archiver-egress --advertise-tags=tag:egress
       - TS_USERSPACE=false
       - TS_ACCEPT_DNS=true
       - TS_AUTH_ONCE=true
