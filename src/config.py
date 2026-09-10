@@ -41,6 +41,22 @@ class Config:
     database_path: str
     ytdlp_config_path: str
 
+    # yt-dlp client fallback (tried in order until one downloads successfully)
+    ytdlp_client_profiles: list[str]
+
+
+# Ordered yt-dlp youtube player_clients the downloader falls back through.
+DEFAULT_CLIENT_PROFILES = ["web_safari", "web_creator", "default"]
+
+
+def _parse_client_profiles(
+    raw: str | None,
+) -> list[str]:
+    if not raw:
+        return list(DEFAULT_CLIENT_PROFILES)
+    profiles = [item.strip() for item in raw.split(",") if item.strip()]
+    return profiles or list(DEFAULT_CLIENT_PROFILES)
+
 
 def load_config() -> Config:
     load_dotenv()
@@ -93,4 +109,8 @@ def load_config() -> Config:
         downloads_dir=os.path.join(data_dir, "downloads"),
         database_path=os.path.join(data_dir, "archiver.db"),
         ytdlp_config_path=os.getenv("YTDLP_CONFIG_PATH", "/app/yt-dlp.conf"),
+        # yt-dlp client fallback
+        ytdlp_client_profiles=_parse_client_profiles(
+            os.getenv("YTDLP_CLIENT_PROFILES"),
+        ),
     )
