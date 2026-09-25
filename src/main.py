@@ -187,6 +187,27 @@ def maybe_daily_sweep(
     db.set_meta("last_uf_sweep_date", today)
 
 
+def maybe_nightly_restart(
+    db: Database,
+) -> None:
+    """Exit for the nightly yt-dlp upgrade at most once per UTC day.
+
+    Docker restarts the container on exit and the entrypoint upgrades yt-dlp on the way up.
+    The fresh process is still idle inside the maintenance window, so without the recorded
+    date it would exit again, looping for the whole window.
+
+    Arguments:
+        db (Database): The local database, which persists the date across restarts.
+    """
+    today = datetime.now(timezone.utc).date().isoformat()
+    if db.get_meta("last_restart_date") == today:
+        return
+    # Recorded before exiting: after sys.exit there is no later chance.
+    db.set_meta("last_restart_date", today)
+    logger.info("Maintenance window, no work pending - restarting for updates")
+    sys.exit(0)
+
+
 def init_sentry(
     config: Config,
 ) -> None:
@@ -401,10 +422,7 @@ def main_loop(
                 now = datetime.now(timezone.utc).time()
                 if RESTART_WINDOW_START <= now <= RESTART_WINDOW_END:
                     maybe_daily_sweep(db, downloader, uploader, api, config)
-                    logger.info(
-                        "Maintenance window, no work pending - restarting for updates"
-                    )
-                    sys.exit(0)
+                    maybe_nightly_restart(db)
             else:
                 logger.info("Found %d new runs to process", len(pending_runs))
 

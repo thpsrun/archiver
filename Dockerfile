@@ -22,7 +22,7 @@ COPY test_videos.tx[t] .
 RUN mkdir -p /app/data/downloads
 
 RUN groupadd -g ${GID} archiver \
-    && useradd -u ${UID} -g ${GID} archiver \
+    && useradd -m -u ${UID} -g ${GID} archiver \
     && chown -R archiver:archiver /app
 
 USER archiver

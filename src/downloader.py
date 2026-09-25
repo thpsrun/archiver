@@ -3,7 +3,9 @@ import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
-from src.config import Config
+import sentry_sdk
+
+from src.config import ClientProfile, Config
 
 logger = logging.getLogger(__name__)
 
@@ -23,6 +25,15 @@ RATE_LIMIT_PATTERNS = [
 
 # Any of these in yt-dlp output means YouTube is actively blocking the download.
 BLOCKING_PATTERNS = COOKIE_PATTERNS + RATE_LIMIT_PATTERNS
+
+# YouTube is doing an experiment of SABR, which just breaks up the video stream. It kinda
+# breaks some things. This new format should help fix it from research???
+FULL_RES_FORMAT = "bestvideo+bestaudio/best[format_id!='18']"
+LAST_RESORT_FORMAT = "bestvideo+bestaudio/best"
+LOW_RES_FORMAT_ID = "18"
+
+# yt-dlp prints this line with the chosen format once the file is in place.
+FORMAT_MARKER = "ARCHIVER_FORMAT "
 
 PROFILE_FALLBACK_PATTERNS = [
     "Requested format is not available",
@@ -63,6 +74,7 @@ class DownloadResult:
     error_message: str | None
     is_youtube_blocked: bool
     is_permanent_failure: bool
+    format_id: str | None = None
 
 
 class Downloader:
@@ -80,30 +92,29 @@ class Downloader:
         video_url: str,
     ) -> DownloadResult:
         output_path = self.downloads_dir / f"{run_id}.mp4"
-        profiles = self.config.ytdlp_client_profiles or ["default"]
+        profiles = self.config.ytdlp_client_profiles or [ClientProfile("default")]
 
-        for index, client in enumerate(profiles):
+        for index, profile in enumerate(profiles):
+            is_last = index == len(profiles) - 1
             result, output = self._attempt_download(
                 run_id,
                 video_url,
                 output_path,
-                client,
+                profile,
+                LAST_RESORT_FORMAT if is_last else FULL_RES_FORMAT,
             )
 
             if result.success:
+                if result.format_id == LOW_RES_FORMAT_ID:
+                    self._report_low_res(run_id, profile)
                 return result
 
-            # it's a permanent failure, so just skip attempting to use other profiles.
-            if result.is_permanent_failure or result.is_youtube_blocked:
-                return result
-
-            is_last = index == len(profiles) - 1
-            if is_last or not self._should_try_next_profile(output):
+            if is_last or not self._should_try_next_profile(profile, result, output):
                 return result
 
             logger.info(
                 "Client %s failed for run %s (%s); trying next profile",
-                client,
+                profile,
                 run_id,
                 result.error_message,
             )
@@ -115,7 +126,8 @@ class Downloader:
         run_id: str,
         video_url: str,
         output_path: Path,
-        client: str,
+        profile: ClientProfile,
+        format_selector: str,
     ) -> tuple[DownloadResult, str]:
         if output_path.exists():
             output_path.unlink()
@@ -125,18 +137,25 @@ class Downloader:
             "--config-location",
             self.config.ytdlp_config_path,
             "--extractor-args",
-            f"youtube:player_client={client}",
+            f"youtube:player_client={profile.client}",
+            "--format",
+            format_selector,
+            "--print",
+            f"after_move:{FORMAT_MARKER}%(format_id)s",
             "--limit-rate",
             self.config.download_rate_limit,
             "--output",
             str(output_path),
-            video_url,
         ]
+        if not profile.use_cookies:
+            # Overrides the config's --cookies (command line wins over the config file).
+            cmd.append("--no-cookies")
+        cmd.append(video_url)
 
         logger.info(
             "Starting download for run %s with client %s: %s",
             run_id,
-            client,
+            profile,
             video_url,
         )
 
@@ -151,7 +170,10 @@ class Downloader:
             combined_output = result.stdout + result.stderr
 
             if result.returncode == 0 and output_path.exists():
-                logger.info("Download successful: %s", output_path)
+                format_id = self._chosen_format(result.stdout)
+                logger.info(
+                    "Download successful: %s (format %s)", output_path, format_id
+                )
                 return (
                     DownloadResult(
                         success=True,
@@ -159,6 +181,7 @@ class Downloader:
                         error_message=None,
                         is_youtube_blocked=False,
                         is_permanent_failure=False,
+                        format_id=format_id,
                     ),
                     combined_output,
                 )
@@ -172,7 +195,7 @@ class Downloader:
             logger.error(
                 "Download failed for run %s (client %s): %s (blocked=%s, permanent=%s)",
                 run_id,
-                client,
+                profile,
                 error_msg,
                 is_blocked,
                 is_permanent,
@@ -189,7 +212,7 @@ class Downloader:
                 combined_output,
             )
         except subprocess.TimeoutExpired:
-            logger.error("Download timed out for run %s (client %s)", run_id, client)
+            logger.error("Download timed out for run %s (client %s)", run_id, profile)
             return (
                 DownloadResult(
                     success=False,
@@ -202,7 +225,7 @@ class Downloader:
             )
         except Exception as e:
             logger.exception(
-                "Unexpected error downloading run %s (client %s)", run_id, client
+                "Unexpected error downloading run %s (client %s)", run_id, profile
             )
             return (
                 DownloadResult(
@@ -216,9 +239,44 @@ class Downloader:
             )
 
     @staticmethod
+    def _report_low_res(
+        run_id: str,
+        profile: ClientProfile,
+    ) -> None:
+        logger.warning(
+            "Run %s archived at 360p (format 18) by last-resort client %s; "
+            "re-archive with --forceupload once full res is available",
+            run_id,
+            profile,
+        )
+        sentry_sdk.capture_message(
+            f"Run {run_id} archived at 360p: no yt-dlp client offered full resolution",
+            level="warning",
+        )
+
+    @staticmethod
+    def _chosen_format(
+        stdout: str,
+    ) -> str | None:
+        for line in stdout.splitlines():
+            if line.startswith(FORMAT_MARKER):
+                return line[len(FORMAT_MARKER) :].strip()
+        return None
+
+    @staticmethod
     def _should_try_next_profile(
+        profile: ClientProfile,
+        result: DownloadResult,
         output: str,
     ) -> bool:
+        if result.is_permanent_failure:
+            return False
+        # A bot check without cookies says nothing about the account, so the cookie profiles
+        # may still work. Rate limits hit the whole IP, so those still stop the ladder.
+        if not profile.use_cookies and is_cookie_related_failure(output):
+            return True
+        if result.is_youtube_blocked:
+            return False
         output_lower = output.lower()
         return any(
             pattern.lower() in output_lower for pattern in PROFILE_FALLBACK_PATTERNS

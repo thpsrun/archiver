@@ -3,6 +3,20 @@ from dataclasses import dataclass
 
 from dotenv import load_dotenv
 
+NO_COOKIES_SUFFIX = ":nocookies"
+
+
+@dataclass(frozen=True)
+class ClientProfile:
+    client: str
+    use_cookies: bool = True
+
+    def __str__(
+        self,
+    ) -> str:
+        """Render the profile the way YTDLP_CLIENT_PROFILES spells it, for logs."""
+        return self.client if self.use_cookies else f"{self.client}{NO_COOKIES_SUFFIX}"
+
 
 @dataclass
 class Config:
@@ -42,19 +56,31 @@ class Config:
     ytdlp_config_path: str
 
     # yt-dlp client fallback (tried in order until one downloads successfully)
-    ytdlp_client_profiles: list[str]
+    ytdlp_client_profiles: list[ClientProfile]
 
 
-# Ordered yt-dlp youtube player_clients the downloader falls back through.
-DEFAULT_CLIENT_PROFILES = ["web_safari", "web_creator", "default"]
+DEFAULT_CLIENT_PROFILES = [
+    ClientProfile("default"),
+    ClientProfile("visionos", use_cookies=False),
+    ClientProfile("web_safari"),
+    ClientProfile("web_creator"),
+]
 
 
 def _parse_client_profiles(
     raw: str | None,
-) -> list[str]:
-    if not raw:
-        return list(DEFAULT_CLIENT_PROFILES)
-    profiles = [item.strip() for item in raw.split(",") if item.strip()]
+) -> list[ClientProfile]:
+    profiles = []
+    for item in (raw or "").split(","):
+        client, separator, modifier = item.strip().partition(":")
+        if not client:
+            continue
+        if separator and f":{modifier}" != NO_COOKIES_SUFFIX:
+            raise ValueError(
+                f"Unknown modifier in YTDLP_CLIENT_PROFILES entry {item.strip()!r}; "
+                f"only {NO_COOKIES_SUFFIX!r} is supported"
+            )
+        profiles.append(ClientProfile(client=client, use_cookies=not separator))
     return profiles or list(DEFAULT_CLIENT_PROFILES)
 
 
